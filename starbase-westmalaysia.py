@@ -232,11 +232,17 @@ CYBERPUNK_CSS = """
         font-family: 'Courier New', monospace !important;
         font-size: 0.8rem !important;
     }
+    .stRadio label {
+        color: #ffffff !important;
+        font-family: 'Courier New', monospace !important;
+        font-size: 0.9rem !important;
+    }
+    .stRadio [role="radiogroup"] { gap: 8px; }
 </style>
 """
 
 # ============================================================================
-# RECOMMENDATION ENGINE
+# RECOMMENDATION ENGINE (with weather actions)
 # ============================================================================
 
 def generate_recommendation_strategy(result_data: Dict) -> Dict:
@@ -247,6 +253,8 @@ def generate_recommendation_strategy(result_data: Dict) -> Dict:
     flood_risk = result_data.get('flood_risk', 'Unknown')
     population_density = result_data.get('population_density', 0)
     coastal_distance = result_data.get('coastal_distance_km', 0)
+    wind_speed = result_data.get('wind_speed_ms', None)
+    wind_gust = result_data.get('wind_gust_ms', None)
 
     recommendations = {
         'immediate_actions': [],
@@ -380,6 +388,30 @@ def generate_recommendation_strategy(result_data: Dict) -> Dict:
         add_action('short_term_actions',
             f'🌐 MODERATE LATITUDE ({lat_deg:.1f}°). Optimize launch trajectories for fuel efficiency.',
             'Medium', '💸💸')
+
+    # ============ 8. WIND / WEATHER ============
+    if wind_speed is not None:
+        if wind_speed > 12:
+            add_action('immediate_actions',
+                f'🌬️ HIGH WIND SPEED ({wind_speed:.1f} m/s). Need robust wind shear protection and launch-window scheduling. High operational cost.',
+                'Critical', '💸💸💸💸')
+        elif wind_speed > 8:
+            add_action('short_term_actions',
+                f'🌬️ MODERATE WIND ({wind_speed:.1f} m/s). Plan wind-monitoring systems and flexible launch windows.',
+                'High', '💸💸💸')
+        elif wind_speed < 4:
+            add_action('immediate_actions',
+                f'✅ EXCELLENT WIND CONDITIONS ({wind_speed:.1f} m/s). Calm, stable air — ideal for launches.',
+                'Low', '💸')
+        else:
+            add_action('short_term_actions',
+                f'🌬️ GOOD WIND ({wind_speed:.1f} m/s). Normal launch conditions. Standard weather monitoring recommended.',
+                'Low', '💸')
+
+        if wind_gust is not None and wind_gust > 15:
+            add_action('short_term_actions',
+                f'💨 STRONG GUSTS ({wind_gust:.1f} m/s). Design structures for high wind-load. Consider reinforced launch pad and hangar.',
+                'High', '💸💸💸')
 
     # ================= FEASIBILITY LOGIC =================
     critical_count = sum(
@@ -1136,6 +1168,50 @@ class SpaceportSuitabilityStrategy(AnalysisStrategy):
             else:
                 return 3.0, 30, 'Fallback: Coastal lowland'
 
+    # ============ NEW: WEATHER (Open-Meteo, no API key) ============
+    def _get_weather(self, location: Location) -> Optional[Dict]:
+        """Fetch current wind & weather from Open-Meteo (free, no API key)."""
+        try:
+            url = "https://api.open-meteo.com/v1/forecast"
+            params = {
+                "latitude": location.lat,
+                "longitude": location.lon,
+                "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,"
+                           "wind_direction_10m,wind_gusts_10m",
+                "wind_speed_unit": "ms",
+                "timezone": "auto",
+            }
+            r = requests.get(url, params=params, timeout=4)
+            data = r.json()
+            cur = data.get("current", {})
+            return {
+                "temperature_c": cur.get("temperature_2m"),
+                "humidity_pct": cur.get("relative_humidity_2m"),
+                "wind_speed_ms": cur.get("wind_speed_10m"),
+                "wind_direction_deg": cur.get("wind_direction_10m"),
+                "wind_gust_ms": cur.get("wind_gusts_10m"),
+                "source": "Open-Meteo (Live)",
+                "time": cur.get("time"),
+            }
+        except Exception:
+            return None
+
+    def _score_wind(self, wind_speed_ms: Optional[float],
+                    wind_gust_ms: Optional[float]) -> tuple:
+        """Score wind conditions 0-5 and return explanation."""
+        if wind_speed_ms is None:
+            return 3.0, "Unknown", "Weather unavailable — neutral score"
+        if wind_speed_ms < 4:
+            return 5.0, "Excellent", f"Calm ({wind_speed_ms:.1f} m/s) — ideal for launches"
+        elif wind_speed_ms < 6:
+            return 4.5, "Good", f"Light breeze ({wind_speed_ms:.1f} m/s) — very suitable"
+        elif wind_speed_ms < 8:
+            return 4.0, "Good", f"Moderate wind ({wind_speed_ms:.1f} m/s) — manageable"
+        elif wind_speed_ms < 12:
+            return 3.0, "Moderate", f"Fairly windy ({wind_speed_ms:.1f} m/s) — schedule around it"
+        else:
+            return 2.0, "Poor", f"High wind ({wind_speed_ms:.1f} m/s) — challenging launches"
+
     def _geographic_score_coastal(self, location: Location) -> tuple:
         lat, lon = location.lat, location.lon
         if lon > 103.0: return 5.0, 0, 'Geographic: East coast (South China Sea)'
@@ -1234,10 +1310,14 @@ class SpaceportSuitabilityStrategy(AnalysisStrategy):
     def analyse(self, location: Location, params: Dict) -> Dict:
         radius = params.get('radius', 10000)
         weights = params.get('weights', {
-            'elevation': 0.15, 'population_density': 0.20,
-            'coastal_proximity': 0.15, 'infrastructure_access': 0.15,
-            'land_availability': 0.15, 'flood_risk': 0.10,
-            'latitudinal_advantage': 0.10
+            'elevation': 0.15,
+            'population_density': 0.18,
+            'coastal_proximity': 0.13,
+            'infrastructure_access': 0.13,
+            'land_availability': 0.13,
+            'flood_risk': 0.10,
+            'latitudinal_advantage': 0.08,
+            'wind_conditions': 0.10,
         })
 
         scores, details = {}, {}
@@ -1286,8 +1366,28 @@ class SpaceportSuitabilityStrategy(AnalysisStrategy):
                                             'weight': weights['latitudinal_advantage'],
                                             'source': 'Geographic'}
 
+        # ============ WIND / WEATHER ============
+        weather_data = self._get_weather(location)
+        if weather_data:
+            ws = weather_data.get('wind_speed_ms')
+            wg = weather_data.get('wind_gust_ms')
+            wind_score, wind_rating, wind_explanation = self._score_wind(ws, wg)
+            data_source_details.append(f"Wind: {wind_explanation}")
+            weather_data['wind_rating'] = wind_rating
+            weather_data['wind_explanation'] = wind_explanation
+        else:
+            wind_score, wind_rating, wind_explanation = 3.0, "Unknown", "Weather unavailable"
+            data_source_details.append("Wind: Weather API unavailable — neutral score")
+
+        scores['wind_conditions'] = wind_score
+        details['wind_conditions'] = {
+            'score': wind_score,
+            'value': weather_data.get('wind_speed_ms') and f"{weather_data['wind_speed_ms']:.1f} m/s" or "N/A",
+            'weight': weights['wind_conditions'],
+            'source': weather_data.get('source', 'Unavailable') if weather_data else 'Unavailable'
+        }
+
         # ============ BASE SCORE (0-100) ============
-        # Each criterion is scored 0-5, so max weighted total = sum(weights) * 5
         total_score = sum(scores[k] * weights.get(k, 0) for k in scores if k in weights)
         max_possible = sum(weights.values()) * 5.0
         percentage = (total_score / max_possible) * 100 if max_possible > 0 else 0
@@ -1310,7 +1410,11 @@ class SpaceportSuitabilityStrategy(AnalysisStrategy):
             penalty += 8.0
             penalty_reasons.append("Scarce land availability: -8%")
 
-        # Clamp final score to 0-100 (never negative, never over 100)
+        if weather_data and weather_data.get('wind_speed_ms'):
+            if weather_data['wind_speed_ms'] > 12:
+                penalty += 8.0
+                penalty_reasons.append(f"Very high wind ({weather_data['wind_speed_ms']:.1f} m/s): -8%")
+
         percentage = max(0.0, min(100.0, percentage - penalty))
 
         if percentage >= 80:
@@ -1351,8 +1455,14 @@ class SpaceportSuitabilityStrategy(AnalysisStrategy):
             'lat_deg': abs(location.lat),
             'data_source_details': data_source_details,
             'used_osm': osm_available, 'osm_data': osm_data if osm_available else None,
+            'weather': weather_data,
+            'wind_speed_ms': weather_data.get('wind_speed_ms') if weather_data else None,
+            'wind_gust_ms': weather_data.get('wind_gust_ms') if weather_data else None,
+            'wind_direction_deg': weather_data.get('wind_direction_deg') if weather_data else None,
+            'temperature_c': weather_data.get('temperature_c') if weather_data else None,
+            'humidity_pct': weather_data.get('humidity_pct') if weather_data else None,
             'used_fallback': True, 'from_cache': False,
-            'analysis_method': 'HYBRID: Geographic Rules (INSTANT) + OSM Background'
+            'analysis_method': 'HYBRID: Geographic Rules + OSM + Weather'
         }
 
 
@@ -1587,8 +1697,8 @@ def init_session_state():
         st.session_state.reasoning_log = []
     if 'current_results' not in st.session_state:
         st.session_state.current_results = None
-    if 'basemap' not in st.session_state:
-        st.session_state.basemap = "OpenStreetMap"
+    if 'basemap_choice' not in st.session_state:
+        st.session_state.basemap_choice = "OpenStreetMap"
     if 'show_radius_circle' not in st.session_state:
         st.session_state.show_radius_circle = True
     if 'comparison_mode' not in st.session_state:
@@ -1638,7 +1748,17 @@ def render_sidebar():
         st.markdown("""<div style="color: #00f0ff; font-family: 'Courier New', monospace;
              letter-spacing: 2px; font-size: 0.9rem; margin-bottom: 10px;">
             🗺️ MAP SETTINGS</div>""", unsafe_allow_html=True)
-        st.session_state.basemap = "OpenStreetMap"
+        basemap_choice = st.radio(
+            "Map Style",
+            options=["🗺️ OpenStreetMap", "🛰️ Satellite"],
+            index=0 if st.session_state.basemap_choice == "OpenStreetMap" else 1,
+            horizontal=True,
+            label_visibility="collapsed"
+        )
+        if "Satellite" in basemap_choice:
+            st.session_state.basemap_choice = "Satellite"
+        else:
+            st.session_state.basemap_choice = "OpenStreetMap"
         st.session_state.show_radius_circle = st.checkbox("Show Search Radius", value=True)
         st.divider()
 
@@ -1670,8 +1790,10 @@ def render_sidebar():
                         {rd['recommendation'][:50]}...</div>
                 </div>
                 """, unsafe_allow_html=True)
-                tag = "🌐 OSM UP-TO-DATE" if rd.get('used_osm') else "📍 GEOGRAPHIC RULES"
-                tcol = "#39ff14" if rd.get('used_osm') else "#00f0ff"
+                if rd.get('used_osm'):
+                    tag, tcol = "🌐 OSM + 🌤️ WEATHER LIVE", "#39ff14"
+                else:
+                    tag, tcol = "📍 GEOGRAPHIC RULES", "#00f0ff"
                 st.markdown(f"""
                 <div style="color: {tcol}; font-family: 'Courier New', monospace;
                      font-size: 0.7rem; letter-spacing: 1px; text-align: center;
@@ -1731,6 +1853,12 @@ def render_sidebar():
         return {'radius': radius}
 
 
+def get_tiles_for_basemap(basemap_choice: str) -> str:
+    if basemap_choice == "Satellite":
+        return "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+    return "OpenStreetMap"
+
+
 def render_map(params):
     st.subheader("🗺️ West Malaysia Spaceport Site Map")
     center = [4.2, 102.0]
@@ -1739,8 +1867,15 @@ def render_map(params):
         center = [st.session_state.selected_location.lat, st.session_state.selected_location.lon]
         name = st.session_state.selected_location.name or "West Malaysia Location"
 
+    basemap_choice = st.session_state.get('basemap_choice', 'OpenStreetMap')
+    tiles_url = get_tiles_for_basemap(basemap_choice)
+
     try:
-        m = folium.Map(location=center, zoom_start=7, tiles="OpenStreetMap")
+        if basemap_choice == "Satellite":
+            m = folium.Map(location=center, zoom_start=7,
+                           tiles=tiles_url, attr='Esri World Imagery')
+        else:
+            m = folium.Map(location=center, zoom_start=7, tiles="OpenStreetMap")
     except Exception:
         m = folium.Map(location=center, zoom_start=7)
 
@@ -1785,7 +1920,7 @@ def render_map(params):
             st.session_state.selected_location = Location(lat=clat, lon=clon, name="West Malaysia Location")
             st.rerun()
     if rd and 'suitability_percentage' in rd:
-        tag = "🌐 OSM Up-to-Date" if rd.get('used_osm') else "📍 Geographic Rules"
+        tag = "🌐 OSM + 🌤️ Weather" if rd.get('used_osm') else "📍 Geographic Rules"
         st.success(f"🚀 {rd['rating']} Suitability: {rd['suitability_percentage']}% ({tag})")
         st.info(f"💡 {rd['recommendation']}")
 
@@ -1799,6 +1934,7 @@ def render_query_interface(params):
         - "Which site has the best launch characteristics?"
         - "Compare all candidate sites for spaceport development"
         - "What are the advantages of Pengerang for a spaceport?"
+        - "How windy is this site?"
         """)
     query = st.text_area("Describe what you want to analyse for spaceport site selection:",
                          placeholder="e.g., Find the best location for a spaceport in West Malaysia",
@@ -1811,7 +1947,7 @@ def render_query_interface(params):
         st.session_state.reasoning_log = []
         st.rerun()
     if analyse_btn and st.session_state.selected_location:
-        with st.spinner("🧠 HYBRID: INSTANT results + OSM background..."):
+        with st.spinner("🧠 HYBRID: INSTANT results + OSM + weather..."):
             pb = st.progress(0); stx = st.empty()
             def upd(p, s): pb.progress(p); stx.text(s)
             result = st.session_state.agent.execute_analysis(
@@ -1859,7 +1995,7 @@ def render_results():
 
     if 'suitability_percentage' in rd:
         if rd.get('used_osm', False):
-            st.success("🌐 **HYBRID: OSM Up-to-Date + Geographic Rules**")
+            st.success("🌐 **HYBRID: OSM + Weather + Geographic Rules**")
         else:
             st.success("📍 **Geographic Rules (INSTANT)** - OSM unavailable")
 
@@ -1876,15 +2012,41 @@ def render_results():
             with st.expander("📊 Data Sources Used"):
                 for d in rd['data_source_details']:
                     if '🌐' in d: st.success(f"🌐 {d}")
+                    elif 'Wind' in d: st.info(f"🌬️ {d}")
                     elif 'Geographic' in d: st.info(f"📍 {d}")
                     elif 'Fallback' in d: st.warning(f"⚠️ {d}")
                     else: st.success(f"✅ {d}")
+
+        # Weather expander
+        weather = rd.get('weather')
+        if weather:
+            with st.expander("🌤️ Live Weather Data (Open-Meteo)", expanded=False):
+                wc1, wc2, wc3 = st.columns(3)
+                with wc1:
+                    if weather.get('wind_speed_ms') is not None:
+                        st.metric("💨 Wind Speed", f"{weather['wind_speed_ms']:.1f} m/s",
+                                  delta=weather.get('wind_rating', ''))
+                    if weather.get('temperature_c') is not None:
+                        st.metric("🌡️ Temperature", f"{weather['temperature_c']:.1f}°C")
+                with wc2:
+                    if weather.get('wind_gust_ms') is not None:
+                        st.metric("🌪️ Wind Gust", f"{weather['wind_gust_ms']:.1f} m/s")
+                    if weather.get('humidity_pct') is not None:
+                        st.metric("💧 Humidity", f"{weather['humidity_pct']:.0f}%")
+                with wc3:
+                    if weather.get('wind_direction_deg') is not None:
+                        dirs = ['N','NE','E','SE','S','SW','W','NW']
+                        deg = weather['wind_direction_deg']
+                        compass = dirs[int((deg + 22.5) % 360 // 45)]
+                        st.metric("🧭 Wind Direction", f"{compass} ({deg:.0f}°)")
+                if weather.get('wind_explanation'):
+                    st.caption(f"**Assessment:** {weather['wind_explanation']}")
 
         if rd.get('used_osm', False) and rd.get('osm_data'):
             with st.expander("🌐 OSM Data Found (Up-to-Date)"):
                 st.json(rd['osm_data'])
 
-        c1, c2, c3 = st.columns([2, 1, 1])
+        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
         with c1:
             st.metric("🚀 Spaceport Suitability", f"{rd['suitability_percentage']}%",
                       delta=f"{rd['rating']} {rd['rating_emoji']}")
@@ -1893,6 +2055,9 @@ def render_results():
             st.metric("Elevation", f"{rd.get('elevation_m', 0):.0f}m")
         with c3:
             st.metric("Latitude", f"{rd.get('lat_deg', 0):.1f}°N")
+        with c4:
+            ws = rd.get('wind_speed_ms')
+            st.metric("💨 Wind", f"{ws:.1f} m/s" if ws is not None else "N/A")
 
         st.write("---")
         st.write("**Detailed Scoring Breakdown:**")
@@ -1902,6 +2067,7 @@ def render_results():
             w = d.get('weight', 0); sc = scores.get(k, 0)
             src = d.get('source', 'Unknown')
             emoji = ('📍' if 'Geographic' in src else '✅' if 'Live' in src
+                     else '🌤️' if 'Open-Meteo' in src
                      else '⚠️' if 'Fallback' in src else 'ℹ️')
             score_data.append({
                 'Criteria': k.replace('_', ' ').title(),
@@ -2032,7 +2198,7 @@ def render_results():
 
 def render_comparison_mode():
     st.subheader("🔄 Site Comparison Dashboard")
-    with st.spinner("Analysing all candidate sites (HYBRID)..."):
+    with st.spinner("Analysing all candidate sites (HYBRID + Weather)..."):
         results = []
         pb = st.progress(0); stx = st.empty()
         for i, (name, coords) in enumerate(WEST_MALAYSIA_SPACEPORT_CANDIDATES.items()):
@@ -2046,16 +2212,17 @@ def render_comparison_mode():
                     results.append({
                         'Site': name, 'Suitability %': r['suitability_percentage'],
                         'Rating': r['rating'], 'Elevation (m)': r.get('elevation_m', 0),
+                        'Wind (m/s)': r.get('wind_speed_ms') if r.get('wind_speed_ms') is not None else 'N/A',
                         'Flood Risk': r.get('flood_risk', 'Unknown'),
                         'Latitude (°)': r.get('lat_deg', 0),
-                        'Method': '🌐 OSM' if r.get('used_osm', False) else '📍 Geographic',
+                        'Method': '🌐 OSM + 🌤️' if r.get('used_osm', False) else '📍 Geographic',
                         'Recommendation': r['recommendation'][:50] + '...',
                         'Data': r
                     })
             except Exception as e:
                 results.append({
                     'Site': name, 'Suitability %': 0, 'Rating': 'Error',
-                    'Elevation (m)': 0, 'Flood Risk': 'Unknown',
+                    'Elevation (m)': 0, 'Wind (m/s)': 'N/A', 'Flood Risk': 'Unknown',
                     'Latitude (°)': abs(coords[0]), 'Method': 'Error',
                     'Recommendation': f"Error: {str(e)[:50]}", 'Data': None
                 })
@@ -2067,7 +2234,7 @@ def render_comparison_mode():
             top = df_sorted.iloc[0]
             st.success(f"🚀 **Top Recommended: {top['Site']}** ({top['Suitability %']:.1f}%)")
             st.caption(top['Recommendation'])
-            cols = ['Site', 'Suitability %', 'Rating', 'Elevation (m)',
+            cols = ['Site', 'Suitability %', 'Rating', 'Elevation (m)', 'Wind (m/s)',
                     'Flood Risk', 'Latitude (°)', 'Method']
             st.dataframe(df_sorted[cols], use_container_width=True, hide_index=True)
             st.bar_chart(df_sorted[['Site', 'Suitability %']].set_index('Site'))
@@ -2076,13 +2243,19 @@ def render_comparison_mode():
             }
             st.write("---")
             st.write("**🗺️ Site Map with Suitability Scores**")
-            m = folium.Map(location=[4.2, 102.0], zoom_start=6, tiles="OpenStreetMap")
+            basemap_choice = st.session_state.get('basemap_choice', 'OpenStreetMap')
+            tiles_url = get_tiles_for_basemap(basemap_choice)
+            if basemap_choice == "Satellite":
+                m = folium.Map(location=[4.2, 102.0], zoom_start=6,
+                               tiles=tiles_url, attr='Esri World Imagery')
+            else:
+                m = folium.Map(location=[4.2, 102.0], zoom_start=6, tiles="OpenStreetMap")
             for _, row in df.iterrows():
                 sc = row['Suitability %']
                 color = ('green' if sc >= 80 else 'lightgreen' if sc >= 65
                          else 'orange' if sc >= 50 else 'lightred' if sc >= 35 else 'red')
                 coords = WEST_MALAYSIA_SPACEPORT_CANDIDATES.get(row['Site'], (0, 0))
-                folium.Marker(coords, popup=f"<b>{row['Site']}</b><br>Suitability: {sc:.1f}%<br>Rating: {row['Rating']}<br>Method: {row['Method']}",
+                folium.Marker(coords, popup=f"<b>{row['Site']}</b><br>Suitability: {sc:.1f}%<br>Rating: {row['Rating']}<br>Wind: {row['Wind (m/s)']} m/s<br>Method: {row['Method']}",
                               tooltip=f"{row['Site']}: {sc:.1f}%",
                               icon=folium.Icon(color=color, icon='rocket', prefix='fa')).add_to(m)
             try: Fullscreen(position='topleft').add_to(m)
@@ -2141,7 +2314,7 @@ def main():
         <div class="cyber-divider"></div>
         <div style="color: #8080a0; font-family: 'Courier New', monospace;
              font-size: 0.7rem; letter-spacing: 4px; margin-top: 5px;">
-            ⚡ HYBRID · OSM LIVE · INSTANT RESULTS ⚡
+            ⚡ HYBRID · OSM LIVE · 🌤️ WEATHER LIVE · INSTANT RESULTS ⚡
         </div>
     </div>
     """, unsafe_allow_html=True)
